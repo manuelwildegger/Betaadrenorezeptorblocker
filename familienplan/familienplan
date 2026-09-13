@@ -1,0 +1,3 @@
+#!/bin/sh
+# Starter fuer den Familien-Dienstplaner (macOS/Linux)
+exec python3 "$(dirname "$0")/familienplan.py" "$@"
