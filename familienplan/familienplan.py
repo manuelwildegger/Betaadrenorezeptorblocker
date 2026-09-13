@@ -150,6 +150,7 @@ class Plan(object):
             dict((p, {}) for p in cfg["personen"])
         for p in cfg["personen"]:
             self.dienste.setdefault(p, {})
+        self.reduziert = {}          # Person -> Wochen mit weniger Diensten
 
     # ---- Struktur -------------------------------------------------------
     @property
@@ -165,6 +166,22 @@ class Plan(object):
 
     def index(self, d):
         return (d - self.start).days
+
+    def wunschfrei(self, person):
+        """Wunschfrei-/Urlaubstage als Menge von Tagindizes."""
+        out = set()
+        for s in self.cfg["personen"][person].get("wunschfrei") or []:
+            try:
+                out.add(self.index(parse_datum(s)))
+            except ValueError:
+                pass
+        return out
+
+    def ist_frei_gewuenscht(self, person, di):
+        return di in self.wunschfrei(person)
+
+    def urlaubswoche(self, person, w):
+        return bool(self.wunschfrei(person) & set(range(w * 7, (w + 1) * 7)))
 
     def schicht(self, person, code):
         return self.cfg["personen"][person]["schichten"][code]
@@ -281,15 +298,20 @@ class Plan(object):
 # --------------------------------------------------------------------------
 # Planerzeugung (regelbasierte Suche)
 # --------------------------------------------------------------------------
-def kandidaten(cfg, person):
+def kandidaten(cfg, person, k=None, pflicht=None):
     """Alle regelkonformen Wochenmuster einer Person.
 
     Ein Muster ist {wochentag_offset: schichtkuerzel} plus vorberechnete
-    Bitmasken fuer Abwesenheit und Erholungsbedarf.
+    Bitmasken fuer Abwesenheit und Erholungsbedarf.  k und pflicht koennen
+    reduziert werden - das wird fuer Urlaubswochen gebraucht.
     """
     pc = cfg["personen"][person]
-    k = int(pc["dienste_pro_woche"])
-    pflicht = list(pc.get("pflicht_schichten") or [])
+    k = int(pc["dienste_pro_woche"]) if k is None else int(k)
+    pflicht = list(pc.get("pflicht_schichten") or []) if pflicht is None \
+        else list(pflicht)
+    if k == 0:
+        return [{"tage": {}, "abw": 0, "erh": 0, "first": None, "last": None,
+                 "tageliste": []}]
     erlaubt = list(pc["schichten"].keys())
     ruhe = int(float(pc["min_ruhe_h"]) * 60)
     n = FENSTER * SPD
@@ -333,7 +355,7 @@ def kandidaten(cfg, person):
 
 VARIANTEN = {
     "lueckenfrei": {
-        "beschreibung": "Betreuungsluecken strikt vermeiden (Standard)",
+        "beschreibung": "Betreuungsluecken strikt vermeiden",
         "gap": 10.0, "konflikt": 3.0, "we": 60.0, "we_maria": 150.0,
         "block": 8.0, "stabil": -40.0, "famtag": -20.0,
     },
@@ -343,26 +365,34 @@ VARIANTEN = {
         "block": 8.0, "stabil": -20.0, "famtag": -220.0,
     },
     "rotierend": {
-        "beschreibung": "Wochenenden rotieren, kleine Luecken erlaubt",
+        "beschreibung": "Wochenenden rotieren, kleine Luecken erlaubt (Standard)",
         "gap": 4.0, "konflikt": 3.0, "we": 500.0, "we_maria": 150.0,
         "block": 8.0, "stabil": 0.0, "famtag": -20.0,
     },
 }
 
 
-def generiere(plan, variante="lueckenfrei", report=None):
+def generiere(plan, variante="rotierend", report=None):
     """Erzeugt Woche fuer Woche das beste zulaessige Muster.
 
     Harte Regeln: Dienste/Woche, Pflichtschichten, Ruhezeit, Wunschfrei und
     das Wochenbudget fuer Fremdbetreuung. Alles andere wird gewichtet.
     """
     cfg = plan.cfg
-    g = VARIANTEN.get(variante, VARIANTEN["lueckenfrei"])
+    g = VARIANTEN.get(variante, VARIANTEN["rotierend"])
     budget = int(float(cfg["externe_hilfe"]["max_h_pro_woche"]) * 60)
     personen = plan.personen
-    kand = dict((p, kandidaten(cfg, p)) for p in personen)
+    cache = {}
+
+    def kand_fuer(p, k, mit_pflicht):
+        schl = (p, k, mit_pflicht)
+        if schl not in cache:
+            cache[schl] = kandidaten(cfg, p, k,
+                                     None if mit_pflicht else [])
+        return cache[schl]
+
     for p in personen:
-        if not kand[p]:
+        if not kand_fuer(p, None, True):
             raise SystemExit("Keine zulaessige Wochenkombination fuer %s - "
                              "Regeln pruefen (Ruhezeit/Dienste pro Woche)." % p)
 
@@ -393,18 +423,27 @@ def generiere(plan, variante="lueckenfrei", report=None):
                     frei.add(di - basis)
             gesperrt[p] = frei
 
-        # zulaessige Kandidaten der Woche je Person
+        # zulaessige Kandidaten der Woche je Person; sind zu viele Tage
+        # gesperrt (Urlaub), wird die Dienstzahl schrittweise reduziert
         moeglich = {}
         for p in personen:
             ruhe = int(float(cfg["personen"][p]["min_ruhe_h"]) * 60)
+            voll = int(cfg["personen"][p]["dienste_pro_woche"])
             liste = []
-            for kd in kand[p]:
-                if gesperrt[p] & set(kd["tageliste"]):
-                    continue
-                if letztes_ende[p] is not None:
-                    if basis * 1440 + kd["first"] - letztes_ende[p] < ruhe:
+            for stufe in range(voll, -1, -1):
+                roh = kand_fuer(p, stufe, stufe == voll)
+                liste = []
+                for kd in roh:
+                    if gesperrt[p] & set(kd["tageliste"]):
                         continue
-                liste.append(kd)
+                    if letztes_ende[p] is not None and kd["first"] is not None:
+                        if basis * 1440 + kd["first"] - letztes_ende[p] < ruhe:
+                            continue
+                    liste.append(kd)
+                if liste:
+                    if stufe < voll:
+                        plan.reduziert.setdefault(p, set()).add(w)
+                    break
             if not liste:
                 raise SystemExit("Woche %d: keine zulaessige Loesung fuer %s."
                                  % (w + 1, p))
@@ -468,7 +507,8 @@ def generiere(plan, variante="lueckenfrei", report=None):
             kd = bestes[p]
             for d, code in kd["tage"].items():
                 plan.setze(p, basis + d, code)
-            letztes_ende[p] = basis * 1440 + kd["last"]
+            if kd["last"] is not None:
+                letztes_ende[p] = basis * 1440 + kd["last"]
             we_ist[p] += len(we_tage & set(kd["tageliste"]))
             vorwoche[p] = kd["tage"]
             carry[p] = kd["abw"] >> (7 * SPD)
@@ -480,7 +520,7 @@ def generiere(plan, variante="lueckenfrei", report=None):
     return plan
 
 
-def neuer_plan(start=None, wochen=None, cfg=None, variante="lueckenfrei"):
+def neuer_plan(start=None, wochen=None, cfg=None, variante="rotierend"):
     cfg = json.loads(json.dumps(cfg or DEFAULT_CONFIG))
     s = parse_datum(start or cfg["start"])
     w = int(wochen or cfg["wochen"])
@@ -535,6 +575,8 @@ def zelle(plan, p, di, breite):
         sh = plan.schicht(p, code)
         ue = "+1" if hhmm(sh["bis"]) <= hhmm(sh["von"]) else ""
         teile.append("%s %s–%s%s" % (code, sh["von"], sh["bis"], ue))
+    if not teile and plan.ist_frei_gewuenscht(p, di):
+        teile.append("Urlaub / frei")
     txt = "  ".join(teile) if teile else "–"
     return txt.ljust(breite)[:breite]
 
@@ -589,13 +631,15 @@ def zeige_plan(plan, wochen=None, farbig=True):
           " beide zuhause   " + (c("▒", "gelb") if farbig else "-") +
           " eine/r zuhause   " + (c("!", "rot") if farbig else "!") +
           " Betreuungslücke")
-    print("            f = Frühdienst   s = Spätdienst   n = Nachtdienst   – = frei")
+    print("            f = Frühdienst   s = Spätdienst   n = Nachtdienst   U = Urlaub   – = frei")
 
 
 def kompakt_zeichen(plan, p, di):
     code = plan.code(p, di)
     if code:
         return code
+    if plan.ist_frei_gewuenscht(p, di):
+        return "U"
     vor = plan.code(p, di - 1) if di > 0 else None
     if vor:
         sh = plan.schicht(p, vor)
@@ -649,7 +693,8 @@ def zeige_kompakt(plan, stil="tabelle", farbig=True):
             print()
     if stil != "plain":
         linie()
-    print("  f Frühdienst · s Spätdienst · n Nachtdienst · · frei · > Nacht läuft aus")
+    print("  f Frühdienst · s Spätdienst · n Nachtdienst · U Urlaub · "
+          "· frei · > Nacht läuft aus")
 
 
 def zeige_betreuung(plan, farbig=True):
@@ -692,8 +737,12 @@ def regelpruefung(plan):
         ruhe = float(pc["min_ruhe_h"])
         pflicht = pc.get("pflicht_schichten") or []
         vertrag = float(pc["vertrag_h_woche"])
+        urlaub = [w for w in range(plan.wochen)
+                  if plan.urlaubswoche(p, w)
+                  and plan.wochenstat(p, w)["dienste"] < soll]
+        normal = [w for w in range(plan.wochen) if w not in urlaub]
         fehl = []
-        for w in range(plan.wochen):
+        for w in normal:
             st = plan.wochenstat(p, w)
             if st["dienste"] != soll:
                 fehl.append("W%d: %d statt %d Dienste" % (w + 1, st["dienste"], soll))
@@ -702,11 +751,17 @@ def regelpruefung(plan):
         if pflicht:
             fehl = [("W%d: %s fehlt" % (w + 1, "/".join(
                 sorted(set(pflicht) - set(plan.wochenstat(p, w)["codes"])))))
-                for w in range(plan.wochen)
+                for w in normal
                 if not set(pflicht) <= set(plan.wochenstat(p, w)["codes"])]
             res.append(("ok" if not fehl else "fail",
                         "%s: jede Schicht (%s) mindestens 1x pro Woche  %s"
                         % (p, "/".join(pflicht), "; ".join(fehl))))
+        if urlaub:
+            res.append(("warn",
+                        "%s: %d Urlaubswoche(n) mit weniger Diensten (%s) – "
+                        "oben nicht mitgerechnet"
+                        % (p, len(urlaub),
+                           ", ".join("W%d" % (w + 1) for w in urlaub))))
         iv = plan.intervalle(p)
         verst = []
         for i in range(len(iv) - 1):
@@ -719,11 +774,12 @@ def regelpruefung(plan):
         res.append(("ok" if not verst else "fail",
                     "%s: Ruhezeit ≥ %.0f h  (kürzeste Pause %s h)  %s"
                     % (p, ruhe, hm(mini), "; ".join(verst))))
-        abw = [abs(plan.wochenstat(p, w)["netto_h"] - vertrag)
-               for w in range(plan.wochen)]
+        abw = [abs(plan.wochenstat(p, w)["netto_h"] - vertrag) for w in normal] or [0.0]
         res.append(("ok" if max(abw) <= 0.1 else "warn",
-                    "%s: Vertrag %.1f h/Woche  (Ist %.1f h, Abweichung %.1f h)"
-                    % (p, vertrag, plan.wochenstat(p, 0)["netto_h"], max(abw))))
+                    "%s: Vertrag %.1f h/Woche  (Ist %.1f h, größte Abweichung %.1f h)"
+                    % (p, vertrag,
+                       plan.wochenstat(p, normal[0] if normal else 0)["netto_h"],
+                       max(abw))))
     lkges = []
     for w in range(plan.wochen):
         lkges.append(sum(e - s for s, e in plan.luecken_woche(w, arr)))
@@ -738,7 +794,7 @@ def regelpruefung(plan):
             verletzt = [s for s in wf
                         if plan.code(p, plan.index(parse_datum(s))) is not None]
             res.append(("ok" if not verletzt else "fail",
-                        "%s: Wunschfrei eingehalten (%d Termine)%s"
+                        "%s: Urlaub/Wunschfrei eingehalten (%d Tage)%s"
                         % (p, len(wf), "" if not verletzt else " – " + ", ".join(verletzt))))
     return res
 
@@ -950,6 +1006,108 @@ def cmd_vergleich(args):
     print("  \u00dcbernehmen mit:  familienplan.py vergleich --uebernehmen <variante>")
 
 
+def cmd_bilanz(args):
+    """Monatsuebersicht - sinnvoll bei langen Planungszeitraeumen."""
+    plan = hole_plan()
+    arr = plan.abdeckung()
+    monate = []
+    daten = {}
+    for di in range(plan.tage):
+        d = plan.datum(di)
+        s = (d.year, d.month)
+        if s not in daten:
+            monate.append(s)
+            daten[s] = {"luecke": 0}
+            for p in plan.personen:
+                daten[s][p] = {"dienste": 0, "we": 0, "h": 0.0}
+        z = daten[s]
+        z["luecke"] += sum(SLOT for sl in range(di * SPD, (di + 1) * SPD)
+                           if arr[sl] <= 0)
+        for p in plan.personen:
+            code = plan.code(p, di)
+            if code:
+                z[p]["dienste"] += 1
+                z[p]["h"] += float(plan.schicht(p, code).get("netto_h", 0))
+                if d.weekday() >= 5:
+                    z[p]["we"] += 1
+    kasten("BILANZ  %s – %s" % (d_kurz(plan.start), d_kurz(plan.datum(plan.tage - 1))))
+    print("  %-10s %s %s" % ("Monat",
+                             " ".join("%-24s" % p for p in plan.personen),
+                             "Fremdbetreuung"))
+    print("  %-10s %s" % ("", " ".join(
+        "%-24s" % "Dienste / WE / Stunden" for _ in plan.personen)))
+    gesamt = dict((p, {"dienste": 0, "we": 0, "h": 0.0}) for p in plan.personen)
+    gl = 0
+    for s in monate:
+        z = daten[s]
+        gl += z["luecke"]
+        zellen = []
+        for p in plan.personen:
+            zellen.append("%-24s" % ("%3d  /  %2d  /  %6.1f h"
+                                     % (z[p]["dienste"], z[p]["we"], z[p]["h"])))
+            for k in gesamt[p]:
+                gesamt[p][k] += z[p][k]
+        print("  %-10s %s %s" % ("%02d/%d" % (s[1], s[0]), " ".join(zellen),
+                                 hm(z["luecke"]) + " h"))
+    zellen = ["%-24s" % ("%3d  /  %2d  /  %6.1f h"
+                         % (gesamt[p]["dienste"], gesamt[p]["we"], gesamt[p]["h"]))
+              for p in plan.personen]
+    print("  " + c("%-10s %s %s" % ("gesamt", " ".join(zellen), hm(gl) + " h"), "fett"))
+    linie()
+    print("  WE = Dienste an Samstagen und Sonntagen · Stunden = bezahlte Arbeitszeit")
+
+
+def cmd_urlaub(args):
+    plan = hole_plan()
+    if args.liste or not args.person:
+        kasten("URLAUB / WUNSCHFREI")
+        leer = True
+        for p in plan.personen:
+            tage = sorted(plan.cfg["personen"][p].get("wunschfrei") or [])
+            if tage:
+                leer = False
+            print("  %-8s %s" % (p, ", ".join(
+                parse_datum(t).strftime("%d.%m.%Y") for t in tage) or "–"))
+        linie()
+        if leer:
+            print("  Eintragen mit:  familienplan.py urlaub Manuel 24.12.2026 03.01.2027")
+        return
+
+    if args.person not in plan.personen:
+        raise SystemExit("  Unbekannte Person. Möglich: %s" % ", ".join(plan.personen))
+    if not args.von:
+        raise SystemExit("  Bitte Datum angeben, z. B. urlaub Manuel 24.12.2026 03.01.2027")
+    von = parse_datum(args.von)
+    bis = parse_datum(args.bis) if args.bis else von
+    if bis < von:
+        von, bis = bis, von
+    tage = []
+    d = von
+    while d <= bis:
+        tage.append(d.isoformat())
+        d += timedelta(days=1)
+
+    pc = plan.cfg["personen"][args.person]
+    vorhanden = set(pc.get("wunschfrei") or [])
+    if args.loeschen:
+        vorhanden -= set(tage)
+        wort = "ausgetragen"
+    else:
+        vorhanden |= set(tage)
+        wort = "eingetragen"
+    pc["wunschfrei"] = sorted(vorhanden)
+
+    print("  %s: %d Tag(e) %s (%s – %s)"
+          % (args.person, len(tage), wort,
+             von.strftime("%d.%m.%Y"), bis.strftime("%d.%m.%Y")))
+    print("  Plan wird neu berechnet – manuelle Einzeländerungen gehen dabei verloren.\n")
+    generiere(plan, plan.cfg.get("variante", "rotierend"))
+    plan.speichern()
+    zeige_kompakt(plan)
+    print()
+    zeige_check(plan)
+
+
 def cmd_export(args):
     plan = hole_plan()
     ziel = args.datei or os.path.join(os.getcwd(), "dienstplan." + args.format)
@@ -982,6 +1140,8 @@ MENUE = [
     ("7", "Dienst ändern"),
     ("8", "Plan neu berechnen"),
     ("9", "Export (CSV / Kalender)"),
+    ("b", "Bilanz pro Monat"),
+    ("u", "Urlaub / Wunschfrei"),
     ("v", "Szenarien vergleichen"),
     ("0", "Beenden"),
 ]
@@ -1028,12 +1188,25 @@ def menue():
         elif wahl == "8":
             st = input("  Startdatum [%s]: " % plan.start.strftime("%d.%m.%Y")).strip()
             wo = input("  Anzahl Wochen [%d]: " % plan.wochen).strip()
-            va = input("  Variante (%s) [lueckenfrei]: "
-                       % "/".join(sorted(VARIANTEN))).strip() or "lueckenfrei"
+            va = input("  Variante (%s) [rotierend]: "
+                       % "/".join(sorted(VARIANTEN))).strip() or "rotierend"
             plan = neuer_plan(st or plan.start.isoformat(),
                               int(wo) if wo else plan.wochen, variante=va)
             plan.speichern()
             zeige_kompakt(plan)
+        elif wahl == "b":
+            cmd_bilanz(None)
+        elif wahl == "u":
+            cmd_urlaub(argparse.Namespace(person=None, von=None, bis=None,
+                                          loeschen=False, liste=True))
+            p = input("  Person (leer = zurück): ").strip()
+            if p:
+                v = input("  Von (TT.MM.JJJJ): ").strip()
+                b = input("  Bis (leer = ein Tag): ").strip() or None
+                lo = input("  Eintragen oder löschen? [e/l]: ").strip().lower() == "l"
+                cmd_urlaub(argparse.Namespace(person=p, von=v, bis=b,
+                                              loeschen=lo, liste=False))
+                plan = hole_plan()
         elif wahl == "v":
             cmd_vergleich(argparse.Namespace(start=plan.start.isoformat(),
                                              wochen=plan.wochen, uebernehmen=None))
@@ -1062,7 +1235,7 @@ def main(argv=None):
     p.add_argument("--start", help="Startdatum, z. B. 01.11.2026")
     p.add_argument("--wochen", type=int, help="Anzahl Wochen")
     p.add_argument("--variante", choices=sorted(VARIANTEN.keys()),
-                   default="lueckenfrei", help="Planungsstrategie")
+                   default="rotierend", help="Planungsstrategie")
     p.set_defaults(func=cmd_neu)
 
     p = sub.add_parser("vergleich", help="Szenarien nebeneinander vergleichen")
@@ -1096,6 +1269,17 @@ def main(argv=None):
     p.add_argument("schicht", help="f, s, n oder frei")
     p.set_defaults(func=cmd_setze)
 
+    p = sub.add_parser("bilanz", help="Monatsuebersicht (Dienste, Stunden, Luecken)")
+    p.set_defaults(func=cmd_bilanz)
+
+    p = sub.add_parser("urlaub", help="Urlaub / Wunschfrei eintragen")
+    p.add_argument("person", nargs="?", help="Manuel oder Maria")
+    p.add_argument("von", nargs="?", help="Datum oder Beginn des Zeitraums")
+    p.add_argument("bis", nargs="?", help="Ende des Zeitraums (optional)")
+    p.add_argument("--loeschen", action="store_true", help="Tage wieder austragen")
+    p.add_argument("--liste", action="store_true", help="nur anzeigen")
+    p.set_defaults(func=cmd_urlaub)
+
     p = sub.add_parser("export", help="CSV- oder Kalenderdatei schreiben")
     p.add_argument("--format", choices=["csv", "ics"], default="csv")
     p.add_argument("--datei")
@@ -1119,3 +1303,8 @@ if __name__ == "__main__":
         main()
     except KeyboardInterrupt:
         print()
+    except BrokenPipeError:          # z. B. beim Weiterleiten an "head"
+        try:
+            sys.stdout.close()
+        except Exception:
+            pass

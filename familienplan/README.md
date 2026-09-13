@@ -25,7 +25,8 @@ alias dienstplan="~/familienplan/familienplan"
 | Kommando | Wirkung |
 |---|---|
 | `./familienplan neu --start 01.11.2026 --wochen 4` | Plan neu berechnen |
-| `./familienplan neu --variante rotierend` | Plan mit anderer Strategie |
+| `./familienplan neu --wochen 52` | ganzes Jahr durchplanen (ca. 2 Sekunden) |
+| `./familienplan neu --variante familienzeit` | Plan mit anderer Strategie |
 | `./familienplan plan` | große Tabelle mit 24-h-Abdeckungsbalken |
 | `./familienplan plan --woche 2` | nur eine Woche |
 | `./familienplan kompakt` | Kompakttabelle (f/s/n) |
@@ -35,6 +36,10 @@ alias dienstplan="~/familienplan/familienplan"
 | `./familienplan check` | Prüfung aller Regeln |
 | `./familienplan tag 12.11.2026` | ein Tag in 30-Minuten-Auflösung |
 | `./familienplan setze Maria 12.11.2026 f` | Dienst von Hand ändern (`frei` = freinehmen) |
+| `./familienplan urlaub Manuel 24.12.2026 03.01.2027` | Urlaub eintragen, Plan neu rechnen |
+| `./familienplan urlaub --liste` | eingetragenen Urlaub anzeigen |
+| `./familienplan urlaub Manuel 24.12.2026 --loeschen` | Urlaub austragen |
+| `./familienplan bilanz` | Monatsübersicht: Dienste, Wochenenden, Stunden |
 | `./familienplan vergleich` | drei Szenarien nebeneinander |
 | `./familienplan export --format csv` | Tabelle für Numbers/Excel |
 | `./familienplan export --format ics` | Kalenderdatei für Apple Kalender |
@@ -44,7 +49,8 @@ alias dienstplan="~/familienplan/familienplan"
 
 ```
 f  Frühdienst      s  Spätdienst      n  Nachtdienst
-·  frei            >  Nachtdienst des Vortags läuft noch bis 08:00
+·  frei            U  Urlaub / Wunschfrei
+>  Nachtdienst des Vortags läuft noch bis 08:00
 ```
 
 ## Regeln, die das Programm einhält
@@ -69,9 +75,19 @@ Weiche Ziele (werden gewichtet optimiert):
 
 | Variante | Idee |
 |---|---|
-| `lueckenfrei` (Standard) | Betreuungslücken strikt vermeiden, ruhiger Rhythmus |
+| `rotierend` (Standard) | Wochenenddienste rotieren im 2-Wochen-Takt |
+| `lueckenfrei` | Betreuungslücken strikt vermeiden, jede Woche gleicher Rhythmus |
 | `familienzeit` | möglichst viele Tage, an denen niemand arbeitet |
-| `rotierend` | Wochenenddienste rotieren, kleine Lücken im Budget erlaubt |
+
+Vergleichen mit `./familienplan vergleich`, übernehmen mit
+`./familienplan vergleich --uebernehmen familienzeit`.
+
+## Urlaub
+
+`urlaub` trägt Tage ein und rechnet den Plan sofort neu. In Urlaubswochen
+reduziert der Planer die Dienstzahl automatisch, statt die Regeln zu brechen;
+die Regelprüfung weist solche Wochen getrennt aus. Feiertage sind bewusst
+nicht hinterlegt (bundeslandabhängig) – sie lassen sich wie Urlaub eintragen.
 
 ## Einstellungen ändern
 
@@ -98,3 +114,5 @@ Wichtige Stellschrauben:
   (Weg, Übergabe, Pause). Die Vertragsstunden werden separat über `netto_h`
   gezählt: Manuel f 6,5 h + s 7,0 h + n 6,5 h = 20 h; Maria 3 × 5,0 h = 15 h.
 * Wenn ein Elternteil zu Hause ist, gilt die Tochter als betreut.
+* Das Budget von 8 h Fremdbetreuung pro Woche ist ein **Gesamtbudget**,
+  unabhängig davon, wer einspringt.
